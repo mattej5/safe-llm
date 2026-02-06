@@ -1,0 +1,33 @@
+{
+  "name": "mastra-cli-agent",
+  "version": "1.0.0",
+  "description": "CLI Agent using Mastra and LM Studio",
+  "main": "src/index.ts",
+  "bin": {
+    "safellm": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@ai-sdk/openai": "^3.0.25",
+    "@mastra/core": "^1.2.0",
+    "ai": "^6.0.70",
+    "chalk": "^5.6.2",
+    "dotenv": "^16.6.1",
+    "marked": "^15.0.12",
+    "marked-terminal": "^7.3.0",
+    "readline": "^1.3.0",
+    "strip-ansi": "^7.1.2",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/marked-terminal": "^6.1.1",
+    "@types/node": "^20.19.31",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
