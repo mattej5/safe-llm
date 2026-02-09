@@ -1,0 +1,10 @@
+node_modules
+.git
+.safellm
+config.json
+MEMORY.md
+dist
+npm-debug.log
+Dockerfile
+.dockerignore
+docker-compose.yml

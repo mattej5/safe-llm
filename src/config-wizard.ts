@@ -14,12 +14,29 @@ export interface AgentConfig {
     baseUrl: string;
     modelId: string;
     apiKey?: string;
+    tavilyApiKey?: string;
+    disabledTools?: string[];
+    streamResponse?: boolean;
+    resendApiKey?: string;
+    resendFromEmail?: string;
+    primaryEmail?: string;
+    scheduledTasks?: ScheduledTask[];
+}
+
+export interface ScheduledTask {
+    id: string;
+    cronExpression: string;
+    prompt: string;
+    action: 'log' | 'email';
+    emailRecipient?: string;
 }
 
 const DEFAULT_CONFIG: AgentConfig = {
     provider: 'lm-studio',
     baseUrl: 'http://localhost:1234/v1',
     modelId: 'mistralai/ministral-3-14b-reasoning',
+    disabledTools: ['search-tool'], // Disabled by default
+    streamResponse: true,
 };
 
 async function prompt(question: string, defaultValue?: string): Promise<string> {
@@ -44,23 +61,53 @@ export async function loadConfig(): Promise<AgentConfig> {
     try {
         const data = await fs.readFile(CONFIG_FILE, 'utf-8');
         const config = JSON.parse(data);
+
         // Migration: map old lmStudioUrl to baseUrl if missing
         if (!config.baseUrl && config.lmStudioUrl) {
             config.baseUrl = config.lmStudioUrl;
             config.provider = 'lm-studio';
             delete config.lmStudioUrl;
         }
+
+        // Docker Networking Fix: automatically remap localhost -> host.docker.internal
+        if (process.env.RUNNING_IN_DOCKER === 'true') {
+            if (config.baseUrl.includes('localhost') || config.baseUrl.includes('127.0.0.1')) {
+                console.log(chalk.yellow('🐳 Running in Docker: Remapping localhost to host.docker.internal'));
+                config.baseUrl = config.baseUrl
+                    .replace('localhost', 'host.docker.internal')
+                    .replace('127.0.0.1', 'host.docker.internal');
+            }
+        }
+
+        // Auto-fix: Ensure /v1 is present for LM Studio/Ollama if missing
+        // This handles cases where users configured the port but forgot the path suffix
+        if (config.baseUrl && (config.provider === 'lm-studio' || config.provider === 'ollama') && !config.baseUrl.endsWith('/v1')) {
+            // Check if it ends in /v1/ (trailing slash) just in case
+            if (!config.baseUrl.endsWith('/v1/')) {
+                const fixed = config.baseUrl.endsWith('/') ? `${config.baseUrl}v1` : `${config.baseUrl}/v1`;
+                console.log(chalk.yellow(`\n⚠️  Configuration Fix: Appended missing '/v1' to Base URL: ${fixed}`));
+                config.baseUrl = fixed;
+            }
+        }
+
+        // Ensure disabledTools exists
+        if (!config.disabledTools) {
+            config.disabledTools = ['search-tool'];
+        }
+
         return config;
     } catch (error) {
         return DEFAULT_CONFIG;
     }
 }
 
+
 export async function saveConfig(config: AgentConfig): Promise<void> {
     await fs.writeFile(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
 async function checkServiceRunning(port: number): Promise<boolean> {
+    const host = process.env.RUNNING_IN_DOCKER === 'true' ? 'host.docker.internal' : '127.0.0.1';
     return new Promise((resolve) => {
         const socket = new net.Socket();
         socket.setTimeout(1000);
@@ -76,11 +123,14 @@ async function checkServiceRunning(port: number): Promise<boolean> {
             socket.destroy();
             resolve(false);
         });
-        socket.connect(port, '127.0.0.1');
+        socket.connect(port, host);
     });
 }
 
 async function checkLMStudioInstalled() {
+    // In Docker, we can't check host installation easily
+    if (process.env.RUNNING_IN_DOCKER === 'true') return false;
+
     const commonPaths = [
         '/Applications/LM Studio.app',
         `${process.env.HOME}/Applications/LM Studio.app`
@@ -132,32 +182,51 @@ export async function runSetupWizard(): Promise<AgentConfig> {
 
     console.log(chalk.dim(`\nChecking status for ${provider}...`));
 
+    const isDocker = process.env.RUNNING_IN_DOCKER === 'true';
+
     if (provider === 'lm-studio') {
         const isRunning = await checkServiceRunning(1234);
         if (isRunning) {
-            console.log(chalk.green('✅ LM Studio is running.'));
+            console.log(chalk.green(isDocker ? '✅ LM Studio reachable on host.' : '✅ LM Studio is running.'));
         } else {
-            const isInstalled = await checkLMStudioInstalled();
-            if (isInstalled) {
-                console.log(chalk.yellow('⚠️  LM Studio is installed but not running.'));
-                console.log('Please start the LM Studio server.');
+            if (isDocker) {
+                console.log(chalk.yellow('⚠️  Could not reach LM Studio on host machine (host.docker.internal:1234).'));
+                console.log('Ensure LM Studio server is running on your host machine.');
             } else {
-                console.log(chalk.red('❌ LM Studio not detected.'));
+                const isInstalled = await checkLMStudioInstalled();
+                if (isInstalled) {
+                    console.log(chalk.yellow('⚠️  LM Studio is installed but not running.'));
+                    console.log('Please start the LM Studio server.');
+                } else {
+                    console.log(chalk.red('❌ LM Studio not detected.'));
+                }
             }
             await prompt('Press Enter to continue configuration...');
         }
     } else if (provider === 'ollama') {
         const isRunning = await checkServiceRunning(11434);
         if (isRunning) {
-            console.log(chalk.green('✅ Ollama is running.'));
+            console.log(chalk.green(isDocker ? '✅ Ollama reachable on host.' : '✅ Ollama is running.'));
         } else {
-            console.log(chalk.yellow('⚠️  Ollama does not appear to be running on port 11434.'));
+            console.log(chalk.yellow(isDocker ? '⚠️  Could not reach Ollama on host (host.docker.internal:11434).' : '⚠️  Ollama does not appear to be running on port 11434.'));
             console.log('Ensure `ollama serve` is running.');
             await prompt('Press Enter to continue configuration...');
         }
     }
 
-    const baseUrl = await prompt('API Base URL:', defaultBaseUrl);
+    let baseUrl = await prompt('API Base URL:', defaultBaseUrl);
+
+    // Auto-fix: Ensure /v1 is present for standard providers if missing
+    // Many users forget this when typing manually
+    if ((provider === 'lm-studio' || provider === 'ollama') && !baseUrl.endsWith('/v1')) {
+        // Simple heuristic: if it doesn't end with /v1, append it.
+        // Unless user explicitly wants without it? Safest is to ask or just do it with notification.
+        // Given the user complaint, let's fix it automatically.
+        const fixed = baseUrl.endsWith('/') ? `${baseUrl}v1` : `${baseUrl}/v1`;
+        console.log(chalk.yellow(`\n⚠️  Appended '/v1' to Base URL for compatibility: ${fixed}`));
+        baseUrl = fixed;
+    }
+
     const modelId = await prompt('Model ID:', defaultModelId);
 
     // Check if we are keeping the same provider to suggest the old API key
@@ -185,7 +254,54 @@ export async function runSetupWizard(): Promise<AgentConfig> {
         apiKey = await prompt('Enter your API Token:');
     }
 
-    const newConfig: AgentConfig = { provider, baseUrl, modelId, apiKey };
+    // Internet Search Configuration
+    const enableSearch = await prompt('Enable internet search (Tavily API)? (y/N)', 'N');
+    let tavilyApiKey: string | undefined;
+    let disabledTools: string[] = [];
+
+    if (enableSearch.toLowerCase() === 'y') {
+        tavilyApiKey = await prompt('Enter your Tavily API Key:');
+    } else {
+        disabledTools.push('search-tool');
+    }
+
+    // Docker Networking Fix: automatically remap localhost -> host.docker.internal
+    if (process.env.RUNNING_IN_DOCKER === 'true') {
+        if (baseUrl.includes('localhost') || baseUrl.includes('127.0.0.1')) {
+            console.log(chalk.yellow('🐳 Running in Docker: Remapping localhost to host.docker.internal'));
+            baseUrl = baseUrl
+                .replace('localhost', 'host.docker.internal')
+                .replace('127.0.0.1', 'host.docker.internal');
+        }
+    }
+
+    // Stream Response Configuration
+    const streamResponseStr = await prompt('Stream AI response? (Y/n)', 'Y');
+    const streamResponse = streamResponseStr.toLowerCase() !== 'n';
+
+    // Email Configuration (Resend)
+    const enableEmail = await prompt('Enable email sending (Resend API)? (y/N)', 'N');
+    let resendApiKey: string | undefined;
+    let resendFromEmail: string | undefined;
+
+    if (enableEmail.toLowerCase() === 'y') {
+        resendApiKey = await prompt('Enter your Resend API Key:');
+        resendFromEmail = await prompt('Enter "From" email (e.g., onboarding@resend.dev):', 'onboarding@resend.dev');
+    } else {
+        disabledTools.push('resend-email');
+    }
+
+    const newConfig: AgentConfig = {
+        provider,
+        baseUrl,
+        modelId,
+        apiKey,
+        tavilyApiKey,
+        disabledTools,
+        streamResponse,
+        resendApiKey,
+        resendFromEmail
+    };
 
     await saveConfig(newConfig);
     console.log(chalk.green('\n✅ Configuration saved!\n'));

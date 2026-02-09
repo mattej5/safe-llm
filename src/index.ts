@@ -7,7 +7,15 @@ import { marked } from 'marked';
 import TerminalRenderer from 'marked-terminal';
 import chalk from 'chalk';
 import stripAnsi from 'strip-ansi';
-import { weatherTool, timeTool, saveMemoryTool, readMemoryTool, deleteMemoryTool, replaceMemoryTool, listSessionsTool, readSessionTool, renameSessionTool } from './tools';
+import {
+    STATIC_TOOLS,
+    createSearchTool,
+    createResendTool,
+    TOOL_METADATA,
+    createSchedulerTools
+} from './tools';
+import { Scheduler } from './scheduler';
+
 import { SessionManager } from './session-manager';
 
 // Configure marked to use terminal renderer
@@ -73,9 +81,38 @@ marked.use({
     breaks: false,
 });
 
-import { ensureConfig, saveConfig, type AgentConfig } from './config-wizard';
+// Helper function to get tools based on config
+function getEnabledTools(config: AgentConfig) {
+    const tools: Record<string, any> = { ...STATIC_TOOLS };
 
-// ... imports ...
+    // Initialize dynamic tools
+    if (config.tavilyApiKey) {
+        const search = createSearchTool(config.tavilyApiKey);
+        tools[search.id] = search;
+    }
+
+    if (config.resendApiKey) {
+        // Default "from" if not configured (should be in config, but fallback for safety)
+        const from = config.resendFromEmail || 'onboarding@resend.dev';
+        const emailTool = createResendTool(config.resendApiKey, from);
+        tools[emailTool.id] = emailTool;
+    }
+
+    // Filter out disabled tools
+    if (config.disabledTools) {
+        for (const disabledId of config.disabledTools) {
+            // Find key in tools that has this id
+            const key = Object.keys(tools).find(k => tools[k].id === disabledId);
+            if (key) {
+                delete tools[key];
+            }
+        }
+    }
+
+    return tools;
+}
+
+import { ensureConfig, saveConfig, type AgentConfig } from './config-wizard';
 
 // ... imports ...
 import { runSetupWizard } from './config-wizard';
@@ -104,6 +141,28 @@ async function main() {
         console.log(`Endpoint: ${config.baseUrl}`);
         // console.log(`Model:    ${config.modelId}`);
 
+        const activeTools = getEnabledTools(config);
+
+        // Initialize Scheduler
+        const scheduler = new Scheduler(config);
+        const schedulerTools = createSchedulerTools(scheduler);
+
+        // Add Scheduler tools if not disabled
+        Object.assign(activeTools, schedulerTools);
+
+        // Filter disabled tools again for scheduler tools? 
+        // Logic in getEnabledTools handles STATIC_TOOLS and dynamic search/email.
+        // We need to apply disable filter to scheduler tools too.
+        if (config.disabledTools) {
+            for (const disabledId of config.disabledTools) {
+                const key = Object.keys(activeTools).find(k => activeTools[k].id === disabledId);
+                if (key) delete activeTools[key];
+            }
+        }
+
+        const activeToolCount = Object.keys(activeTools).length;
+        console.log(`Tools:    ${activeToolCount} enabled (use /tools to manage)`);
+
         // AI SDK Provider Setup
         let openai = createOpenAI({
             baseURL: config.baseUrl,
@@ -117,8 +176,14 @@ async function main() {
             name: 'Local Agent',
             instructions: 'You are a helpful AI assistant. You can think before answering using <think> tags. Always show your thinking steps. Connect to the user. Do not indent your responses with 4 spaces unless writing code blocks. You have access to a long-term memory. Use the read-memory tool to check for past information and the save-memory tool to store important details. When reading memory, treat the file as a chronological log. If you find conflicting information (e.g. user preferences changing), always prioritize the most recent entry based on the timestamp.',
             model: openai.chat(config.modelId),
-            tools: { weatherTool, timeTool, saveMemoryTool, readMemoryTool, deleteMemoryTool, replaceMemoryTool, listSessionsTool, readSessionTool, renameSessionTool },
+            tools: activeTools,
+
+
         });
+
+        // Initialize Scheduler with Agent
+        scheduler.setAgent(agent);
+        await scheduler.startAll();
 
         // Connection Check
         const connected = await checkConnectionAndPrompt(config);
@@ -130,7 +195,7 @@ async function main() {
         console.log(chalk.bold.cyan('\n🤖 Agent Ready! Type "exit", "quit", or "/config" to configure a new connection.'));
 
         // Run Chat Session
-        const action = await runChatSession(agent, sessionManager);
+        const action = await runChatSession(agent, sessionManager, config);
 
         if (action === 'quit') {
             console.log('Goodbye!');
@@ -138,6 +203,9 @@ async function main() {
         } else if (action === 'configure') {
             config = await runSetupWizard();
             // Loop continues with new config
+        } else if (action === 'reload') {
+            // Loop continues, reloading agent with current config
+            continue;
         }
     }
 }
@@ -172,6 +240,8 @@ async function checkConnectionAndPrompt(config: any): Promise<boolean> {
                     const newConfig = await runSetupWizard();
                     Object.assign(config, newConfig); // Update the passed config object in place
 
+                    // Also need to save it? runSetupWizard saves it.
+
                     continue; // Retry connection with new config
                 } catch (e) {
                     console.error(e);
@@ -182,9 +252,34 @@ async function checkConnectionAndPrompt(config: any): Promise<boolean> {
 }
 
 // Shared commands list for autocomplete and ghost text
-const COMMANDS = ['/help', '/config', '/clear', '/history', '/load ', '/rename ', '/exit', '/quit'];
+const COMMANDS = ['/help', '/config', '/clear', '/history', '/load ', '/rename ', '/tools', '/exit', '/quit'];
 
-function runChatSession(agent: Agent, sessionManager: SessionManager): Promise<'quit' | 'configure'> {
+// Spinner implementation
+class Spinner {
+    private timer: NodeJS.Timeout | null = null;
+    private frames = ['Thinking   ', 'Thinking.  ', 'Thinking.. ', 'Thinking...'];
+    private currentFrame = 0;
+
+    start() {
+        if (this.timer) return;
+        process.stdout.write('\u001b[?25l'); // Hide cursor
+        this.timer = setInterval(() => {
+            process.stdout.write(`\r${chalk.dim(this.frames[this.currentFrame])}`);
+            this.currentFrame = (this.currentFrame + 1) % this.frames.length;
+        }, 500);
+    }
+
+    stop() {
+        if (this.timer) {
+            clearInterval(this.timer);
+            this.timer = null;
+            process.stdout.write('\r\x1b[K'); // Clear line
+            process.stdout.write('\u001b[?25h'); // Show cursor
+        }
+    }
+}
+
+function runChatSession(agent: Agent, sessionManager: SessionManager, config: AgentConfig): Promise<'quit' | 'configure' | 'reload'> {
     return new Promise((resolve) => {
         const completer = (line: string) => {
             const hits = COMMANDS.filter((c) => c.startsWith(line));
@@ -298,10 +393,90 @@ function runChatSession(agent: Agent, sessionManager: SessionManager): Promise<'
                 return;
             }
 
+            // Tools Management Command
+            if (input.startsWith('/tools')) {
+                const parts = input.split(' ');
+                const subcmd = parts[1];
+                const arg = parts[2];
+
+                if (!subcmd || subcmd === 'list') {
+                    console.log(chalk.bold.yellow('\nTool Management:'));
+
+                    // List all possible tools (Static + potential Dynamic)
+                    const potentialTools: Record<string, any> = { ...STATIC_TOOLS };
+                    if (config.tavilyApiKey) {
+                        // Just a dummy to show it exists in potential list
+                        potentialTools['search-tool'] = { id: 'search-tool' } as any;
+                    } else {
+                        // If no key, show it as unavailable? Or just don't show?
+                        // Let's show it but mark as missing key
+                        // Actually, better to just iterate TOOL_METADATA to show what's *possible*
+                    }
+
+                    const disabledList = config.disabledTools || [];
+
+                    Object.entries(TOOL_METADATA).forEach(([id, name]) => {
+                        let status = chalk.green('Enabled');
+
+                        if (disabledList.includes(id)) {
+                            status = chalk.red('Disabled');
+                        } else if (id === 'search-tool' && !config.tavilyApiKey) {
+                            status = chalk.dim('Missing Config (API Key)');
+                        }
+
+                        console.log(`${chalk.cyan(name.padEnd(30))} [${id.padEnd(20)}] ${status}`);
+                    });
+                    console.log(chalk.dim('\nUsage: /tools enable <id>, /tools disable <id>'));
+                } else if (subcmd === 'enable') {
+                    if (!arg) {
+                        console.log(chalk.red('Usage: /tools enable <id>'));
+                    } else {
+                        if (!config.disabledTools?.includes(arg)) {
+                            console.log(chalk.yellow(`Tool '${arg}' is already enabled (or unknown).`));
+                        } else {
+                            config.disabledTools = config.disabledTools.filter(t => t !== arg);
+                            await saveConfig(config);
+                            console.log(chalk.green(`Enabled '${arg}'. Reloading agent...`));
+                            cleanup();
+                            rl.close();
+                            resolve('reload');
+                            return;
+                        }
+                    }
+                } else if (subcmd === 'disable') {
+                    if (!arg) {
+                        console.log(chalk.red('Usage: /tools disable <id>'));
+                    } else {
+                        if (!config.disabledTools) config.disabledTools = [];
+                        if (config.disabledTools.includes(arg)) {
+                            console.log(chalk.yellow(`Tool '${arg}' is already disabled.`));
+                        } else {
+                            if (!TOOL_METADATA[arg]) {
+                                console.log(chalk.red(`Unknown tool ID: ${arg}`));
+                            } else {
+                                config.disabledTools.push(arg);
+                                await saveConfig(config);
+                                console.log(chalk.red(`Disabled '${arg}'. Reloading agent...`));
+                                cleanup();
+                                rl.close();
+                                resolve('reload');
+                                return;
+                            }
+                        }
+                    }
+                } else {
+                    console.log(chalk.red('Unknown subcommand. Use list, enable, or disable.'));
+                }
+
+                rl.prompt();
+                return;
+            }
+
             if (input === '/help') {
                 console.log(chalk.bold.yellow('\nAvailable Commands:'));
                 console.log(chalk.yellow('  /help   - Show this help message'));
                 console.log(chalk.yellow('  /config - Run setup wizard again'));
+                console.log(chalk.yellow('  /tools  - Manage agent tools'));
                 console.log(chalk.yellow('  /clear  - Clear conversation context'));
                 console.log(chalk.yellow('  /history - List past conversation sessions'));
                 console.log(chalk.yellow('  /load <id> - Load a past session'));
@@ -377,27 +552,61 @@ function runChatSession(agent: Agent, sessionManager: SessionManager): Promise<'
             }
 
             try {
-                console.log(chalk.dim('Thinking...'));
                 messages.push({ role: 'user', content: input });
                 await sessionManager.logInteraction(messages);
 
-                const result = await agent.generate(messages);
-                let responseText = result.text;
-                // @ts-ignore
-                if (!responseText && result.reasoningText) {
+                let responseText = '';
+
+                if (config.streamResponse) {
+                    console.log(chalk.dim('Thinking... (Streaming)\n'));
+
+                    const result = await agent.stream(messages);
+
+                    // console.log('') // Start new line for stream
+
+                    for await (const chunk of result.textStream) {
+                        process.stdout.write(chunk);
+                        responseText += chunk;
+                    }
+                    console.log('\n'); // Ensure newline after stream
+
+                } else {
+                    const spinner = new Spinner();
+                    spinner.start();
+
+                    const result = await agent.generate(messages);
+                    spinner.stop();
+
+                    responseText = result.text;
                     // @ts-ignore
-                    responseText = result.reasoningText;
+                    if (!responseText && result.reasoningText) {
+                        // @ts-ignore
+                        responseText = result.reasoningText;
+                    }
                 }
 
                 if (!responseText) {
                     console.error('⚠️ Empty response generated.');
                 }
 
-                // ... Rendering Logic ...
-                // Reusing the formatting logic from before, abbreviated for brevity in replacement?
-                // No, must copy it all or we lose it.
-                // --- COPYING RENDERING LOGIC ---
-                let formattedResponse = responseText.replace(/^\s*<think>([\s\S]*?)<\/think>/, (match, content) => {
+                // ... Rendering Logic (Clear and Render Markdown) ...
+                // Note: If streaming, we might want to clear the screen or just print the markdown AFTER?
+                // User requirement: "Otherwise, we can replace the "Thinking..." text... with a basic text animation"
+                // Plan said: "Once the stream is complete, functionality will clear the raw output and replace it with the beautified Markdown"
+
+                // Clear the raw output if streaming? 
+                // That might be jarring if the user was reading along.
+                // But the plan "The CLI will first stream raw text... clear the raw output and replace it with the beautified Markdown" was approved.
+                // So I will implement exactly that.
+
+                if (config.streamResponse) {
+                    // Clear the raw stream output to replace with formatted version
+                    console.clear();
+                    // Reprint the User's input so context is maintained for this turn
+                    console.log(chalk.bold.green('\n> ') + input + '\n');
+                }
+
+                let formattedResponse = responseText.replace(/^\s*<think>([\s\S]*?)<\/think>/, (match: string, content: string) => {
                     const lines = content.split('\n');
                     let minIndent = Infinity;
                     for (const line of lines) {
@@ -412,10 +621,14 @@ function runChatSession(agent: Agent, sessionManager: SessionManager): Promise<'
                     return `\n> **Thinking Process:**\n> ${excerpt}\n\n---\n\n**Response:**\n\n`;
                 });
 
-                // Helper to setup renderer needed since we are in a new scope?
-                // Actually 'renderer' and 'marked' are global in the module scope, so they are fine.
-
                 const rendered = marked.parse(formattedResponse);
+
+                if (config.streamResponse) {
+                    // This line is now redundant as console.clear() was called.
+                    // console.log(chalk.dim('─'.repeat(process.stdout.columns || 80)));
+                    // console.log(chalk.bold.green('Formatted Output:'));
+                }
+
                 console.log(chalk.dim('─'.repeat(process.stdout.columns || 80)));
                 console.log(rendered);
                 console.log(chalk.dim('─'.repeat(process.stdout.columns || 80)));
