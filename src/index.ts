@@ -14,6 +14,7 @@ import {
     TOOL_METADATA,
     createSchedulerTools
 } from './tools';
+import { createAgent } from './agent-factory';
 import { Scheduler } from './scheduler';
 
 import { SessionManager } from './session-manager';
@@ -81,36 +82,7 @@ marked.use({
     breaks: false,
 });
 
-// Helper function to get tools based on config
-function getEnabledTools(config: AgentConfig) {
-    const tools: Record<string, any> = { ...STATIC_TOOLS };
 
-    // Initialize dynamic tools
-    if (config.tavilyApiKey) {
-        const search = createSearchTool(config.tavilyApiKey);
-        tools[search.id] = search;
-    }
-
-    if (config.resendApiKey) {
-        // Default "from" if not configured (should be in config, but fallback for safety)
-        const from = config.resendFromEmail || 'onboarding@resend.dev';
-        const emailTool = createResendTool(config.resendApiKey, from);
-        tools[emailTool.id] = emailTool;
-    }
-
-    // Filter out disabled tools
-    if (config.disabledTools) {
-        for (const disabledId of config.disabledTools) {
-            // Find key in tools that has this id
-            const key = Object.keys(tools).find(k => tools[k].id === disabledId);
-            if (key) {
-                delete tools[key];
-            }
-        }
-    }
-
-    return tools;
-}
 
 import { ensureConfig, saveConfig, type AgentConfig } from './config-wizard';
 
@@ -141,49 +113,20 @@ async function main() {
         console.log(`Endpoint: ${config.baseUrl}`);
         // console.log(`Model:    ${config.modelId}`);
 
-        const activeTools = getEnabledTools(config);
+        // Create Agent and Scheduler using the factory
+        // If we want to persist the scheduler across loops (for tasks) we might need to handle it differently?
+        // But the original code created a new scheduler every loop: "const scheduler = new Scheduler(config);"
+        // So this is consistent.
+        // Wait, if loop restarts (e.g. config change), scheduler should probably restart too.
 
-        // Initialize Scheduler
-        const scheduler = new Scheduler(config);
-        const schedulerTools = createSchedulerTools(scheduler);
+        const { agent, scheduler, activeTools } = await createAgent(config);
 
-        // Add Scheduler tools if not disabled
-        Object.assign(activeTools, schedulerTools);
-
-        // Filter disabled tools again for scheduler tools? 
-        // Logic in getEnabledTools handles STATIC_TOOLS and dynamic search/email.
-        // We need to apply disable filter to scheduler tools too.
-        if (config.disabledTools) {
-            for (const disabledId of config.disabledTools) {
-                const key = Object.keys(activeTools).find(k => activeTools[k].id === disabledId);
-                if (key) delete activeTools[key];
-            }
-        }
-
-        const activeToolCount = Object.keys(activeTools).length;
-        console.log(`Tools:    ${activeToolCount} enabled (use /tools to manage)`);
-
-        // AI SDK Provider Setup
-        let openai = createOpenAI({
-            baseURL: config.baseUrl,
-            apiKey: config.apiKey || 'not-needed',
-            // @ts-expect-error - feature is available in runtime but missing in types
-            compatibility: 'strict',
-        });
-
-        let agent = new Agent({
-            id: 'local-agent',
-            name: 'Local Agent',
-            instructions: 'You are a helpful AI assistant. You can think before answering using <think> tags. Always show your thinking steps. Connect to the user. Do not indent your responses with 4 spaces unless writing code blocks. You have access to a long-term memory. Use the read-memory tool to check for past information and the save-memory tool to store important details. When reading memory, treat the file as a chronological log. If you find conflicting information (e.g. user preferences changing), always prioritize the most recent entry based on the timestamp.',
-            model: openai.chat(config.modelId),
-            tools: activeTools,
-
-
-        });
-
-        // Initialize Scheduler with Agent
-        scheduler.setAgent(agent);
+        // Start scheduler
         await scheduler.startAll();
+
+        // const activeTools = agent.tools; // Get tools from agent to show count
+
+        // ... (connection check) ...
 
         // Connection Check
         const connected = await checkConnectionAndPrompt(config);

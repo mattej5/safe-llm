@@ -5,7 +5,31 @@ import * as net from 'net';
 import * as readline from 'readline';
 import chalk from 'chalk';
 
-const CONFIG_FILE = path.join(process.cwd(), 'config.json');
+// Helper to find config file
+async function getConfigPath(): Promise<string> {
+    const cwd = process.cwd();
+    const localPath = path.join(cwd, 'config.json');
+    const parentPath = path.join(cwd, '..', 'config.json');
+
+    try {
+        await fs.access(localPath);
+        return localPath;
+    } catch {
+        try {
+            await fs.access(parentPath);
+            return parentPath;
+        } catch {
+            // Default to local, unless we are in 'web' subdir, then default to parent?
+            // For safety, let's stick to local default for new files, 
+            // BUT if we are in 'web', we probably want to write to root.
+            if (path.basename(cwd) === 'web') {
+                return parentPath;
+            }
+            return localPath;
+        }
+    }
+}
+
 
 export type ProviderType = 'lm-studio' | 'ollama' | 'custom';
 
@@ -59,7 +83,8 @@ async function prompt(question: string, defaultValue?: string): Promise<string> 
 
 export async function loadConfig(): Promise<AgentConfig> {
     try {
-        const data = await fs.readFile(CONFIG_FILE, 'utf-8');
+        const configPath = await getConfigPath();
+        const data = await fs.readFile(configPath, 'utf-8');
         const config = JSON.parse(data);
 
         // Migration: map old lmStudioUrl to baseUrl if missing
@@ -103,7 +128,8 @@ export async function loadConfig(): Promise<AgentConfig> {
 
 
 export async function saveConfig(config: AgentConfig): Promise<void> {
-    await fs.writeFile(CONFIG_FILE, JSON.stringify(config, null, 2));
+    const configPath = await getConfigPath();
+    await fs.writeFile(configPath, JSON.stringify(config, null, 2));
 }
 
 async function checkServiceRunning(port: number): Promise<boolean> {
@@ -311,7 +337,8 @@ export async function runSetupWizard(): Promise<AgentConfig> {
 
 export async function ensureConfig(): Promise<AgentConfig> {
     try {
-        await fs.access(CONFIG_FILE);
+        const configPath = await getConfigPath();
+        await fs.access(configPath);
         return loadConfig();
     } catch {
         return runSetupWizard();

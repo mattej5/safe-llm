@@ -6,6 +6,7 @@ import * as path from 'path';
 const MEMORY_FILE = path.join(process.cwd(), 'MEMORY.md');
 
 import { SessionManager } from './session-manager';
+import { AgentConfig } from './config-wizard';
 const sessionManager = new SessionManager();
 
 export const weatherTool = createTool({
@@ -467,3 +468,34 @@ export const TOOL_METADATA: Record<string, string> = {
     'list_scheduled_tasks': 'List Scheduled Tasks',
     'delete_scheduled_task': 'Delete Scheduled Task',
 };
+
+// Helper function to get tools based on config
+export function getEnabledTools(config: AgentConfig) {
+    const tools: Record<string, any> = { ...STATIC_TOOLS };
+
+    // Initialize dynamic tools
+    if (config.tavilyApiKey) {
+        const search = createSearchTool(config.tavilyApiKey);
+        tools[search.id] = search;
+    }
+
+    if (config.resendApiKey) {
+        // Default "from" if not configured (should be in config, but fallback for safety)
+        const from = config.resendFromEmail || 'onboarding@resend.dev';
+        const emailTool = createResendTool(config.resendApiKey, from);
+        tools[emailTool.id] = emailTool;
+    }
+
+    // Filter out disabled tools
+    if (config.disabledTools) {
+        for (const disabledId of config.disabledTools) {
+            // Find key in tools that has this id
+            const key = Object.keys(tools).find(k => tools[k].id === disabledId);
+            if (key) {
+                delete tools[key];
+            }
+        }
+    }
+
+    return tools;
+}
